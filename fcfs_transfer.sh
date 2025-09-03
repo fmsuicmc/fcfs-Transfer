@@ -1,48 +1,4 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-PROJECT_DIR="${HOME}/fcfs-transfer"
-NODE_VERSION="lts/*"
-
-# Check curl
-if ! command -v curl >/dev/null 2>&1; then
-  if command -v apt-get >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y curl
-  elif command -v yum >/dev/null 2>&1; then sudo yum install -y curl
-  elif command -v brew >/dev/null 2>&1; then brew install curl
-  else echo "Please install curl"; exit 1
-  fi
-fi
-
-# Install nvm if not present
-if [ -z "${NVM_DIR:-}" ]; then export NVM_DIR="$HOME/.nvm"; fi
-if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
-fi
-# shellcheck disable=SC1090
-. "$NVM_DIR/nvm.sh"
-nvm install "${NODE_VERSION}" >/dev/null
-nvm use "${NODE_VERSION}" >/dev/null
-
-mkdir -p "${PROJECT_DIR}"
-cd "${PROJECT_DIR}"
-
-# package.json
-cat > package.json <<'PKG'
-{
-  "name": "fcfs-transfer",
-  "version": "2.0.0",
-  "type": "module",
-  "dependencies": {
-    "ethers": "^6.13.2",
-    "inquirer": "^9.2.15"
-  }
-}
-PKG
-
-npm install >/dev/null
-
-# index.js
-cat > index.js <<'JS'
+#!/usr/bin/env node
 import inquirer from 'inquirer';
 import { ethers } from 'ethers';
 
@@ -51,17 +7,19 @@ const log = (m) => console.log(`[${t()}] ${m}`);
 const ok = (m) => console.log(`[${t()}] ✅ ${m}`);
 const err = (m) => console.log(`[${t()}] ❌ ${m}`);
 
-async function getFees(provider, bump=0n) {
+// ===== Fees =====
+async function getFees(provider, bumpPct=0n) {
   const fd = await provider.getFeeData();
   let { maxFeePerGas, maxPriorityFeePerGas, gasPrice } = fd;
   if (!maxFeePerGas) maxFeePerGas = gasPrice ?? 0n;
-  if (!maxPriorityFeePerGas) maxPriorityFeePerGas = maxFeePerGas/10n;
+  if (!maxPriorityFeePerGas) maxPriorityFeePerGas = maxFeePerGas / 10n;
   return {
-    maxFeePerGas: (maxFeePerGas * (100n+bump))/100n,
-    maxPriorityFeePerGas: (maxPriorityFeePerGas * (100n+bump))/100n,
+    maxFeePerGas: (maxFeePerGas * (100n+bumpPct)) / 100n,
+    maxPriorityFeePerGas: (maxPriorityFeePerGas * (100n+bumpPct)) / 100n,
   };
 }
 
+// ===== Send wrapper (با retry و بدون stop) =====
 async function sendWithBump(sendFn, provider, maxRetries=5) {
   let bump = 20n; // start 20% higher
   for (let i=0; i<maxRetries; i++) {
@@ -69,16 +27,19 @@ async function sendWithBump(sendFn, provider, maxRetries=5) {
       const fees = await getFees(provider, bump);
       return await sendFn(fees);
     } catch(e) {
-      err(`Send failed: ${e?.reason||e?.message||e}`);
-      bump += 20n; // bump more and retry
+      err(`Send failed: ${e?.reason || e?.message || e}`);
+      bump += 20n; // bump more
     }
   }
-  throw new Error('All retries failed');
+  err("All retries failed, skipping this round...");
+  return null; // ادامه بده
 }
 
+// ===== ETH sweeper =====
 async function sweepETH(provider, wallet, dest) {
   const bal = await provider.getBalance(wallet.address);
   if (bal === 0n) { log('Balance=0'); return; }
+
   await sendWithBump(async (fees) => {
     const gasLimit = 21000n;
     const fee = gasLimit * fees.maxFeePerGas;
@@ -97,6 +58,7 @@ async function sweepETH(provider, wallet, dest) {
   }, provider);
 }
 
+// ===== Token sweeper =====
 async function sweepToken(provider, wallet, dest, tokenAddr) {
   const abi = [
     'function balanceOf(address) view returns (uint256)',
@@ -112,6 +74,7 @@ async function sweepToken(provider, wallet, dest, tokenAddr) {
     provider.getBalance(wallet.address)
   ]);
   if (bal === 0n) { log(`${symbol} balance=0`); return; }
+
   await sendWithBump(async (fees) => {
     let gasLimit;
     try { gasLimit = await token.estimateGas.transfer(dest, bal); }
@@ -132,6 +95,7 @@ async function sweepToken(provider, wallet, dest, tokenAddr) {
   }, provider);
 }
 
+// ===== CLI =====
 async function main() {
   const a = await inquirer.prompt([
     {type:'list',name:'asset',message:'Sweep what?',choices:['ETH','TOKEN']},
@@ -141,10 +105,12 @@ async function main() {
     {type:'input',name:'token',message:'Token contract address:',when:(x)=>x.asset==='TOKEN'},
     {type:'input',name:'pollMs',message:'Polling interval (ms):',default:'100',filter:Number}
   ]);
+
   const provider = a.rpcUrl.startsWith('ws') ? new ethers.WebSocketProvider(a.rpcUrl) : new ethers.JsonRpcProvider(a.rpcUrl);
   provider.pollingInterval=a.pollMs;
   const wallet = new ethers.Wallet(a.pk,provider);
   log(`Connected to chainId ${(await provider.getNetwork()).chainId}, address=${wallet.address}`);
+
   if (a.asset==='ETH') {
     setInterval(()=>sweepETH(provider,wallet,a.dest),a.pollMs);
   } else {
@@ -152,6 +118,3 @@ async function main() {
   }
 }
 main();
-JS
-
-node index.js
