@@ -1,17 +1,12 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ------------------------------------------
-# EVM FCFS Sweeper + Live Millisecond Monitor
-# One-shot installer/runner (Linux/macOS)
-# ------------------------------------------
-
+# EVM FCFS Sweeper (ETH + ERC-20) — auto installer & runner with console logs
 PROJECT_DIR="${HOME}/evm-fcfs-sweeper"
 NODE_VERSION="lts/*"
 
-echo ">>> Checking prerequisites (bash, curl)"
+echo ">>> Checking curl..."
 if ! command -v curl >/dev/null 2>&1; then
-  echo "curl not found. Attempting to install..."
   if command -v apt-get >/dev/null 2>&1; then
     sudo apt-get update && sudo apt-get install -y curl
   elif command -v yum >/dev/null 2>&1; then
@@ -19,15 +14,14 @@ if ! command -v curl >/dev/null 2>&1; then
   elif command -v brew >/dev/null 2>&1; then
     brew install curl
   else
-    echo "Please install curl and re-run."
-    exit 1
+    echo "Please install curl and re-run."; exit 1
   fi
 fi
 
-# --- Install NVM if missing ---
+# Install nvm if missing
 if [ -z "${NVM_DIR:-}" ]; then export NVM_DIR="$HOME/.nvm"; fi
 if [ ! -s "$NVM_DIR/nvm.sh" ]; then
-  echo ">>> Installing nvm…"
+  echo ">>> Installing nvm..."
   curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
 fi
 # shellcheck disable=SC1090
@@ -36,16 +30,16 @@ fi
 echo ">>> Installing Node.js ${NODE_VERSION}"
 nvm install "${NODE_VERSION}" >/dev/null
 nvm use "${NODE_VERSION}" >/dev/null
-echo ">>> Node: $(node -v), npm: $(npm -v)"
+echo ">>> Node: $(node -v) | npm: $(npm -v)"
 
-# --- Project skeleton ---
-mkdir -p "${PROJECT_DIR}/logs"
+mkdir -p "${PROJECT_DIR}"
 cd "${PROJECT_DIR}"
 
+# package.json (ESM)
 cat > package.json <<'PKG'
 {
   "name": "evm-fcfs-sweeper",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "type": "module",
   "license": "MIT",
   "bin": { "evm-sweeper": "./index.js" },
@@ -57,115 +51,98 @@ cat > package.json <<'PKG'
 }
 PKG
 
-echo ">>> Installing dependencies…"
+echo ">>> Installing dependencies..."
 npm i >/dev/null
 
-# Optional defaults
+# Optional defaults (می‌تونی بعداً ویرایش کنی)
 if [ ! -f .env ]; then
-  cat > .env <<'ENVEOF'
-# Optional defaults – prompts will ask anyway
+cat > .env <<'ENVEOF'
 # RPC_URL=wss://ethereum.publicnode.com
 # PRIVATE_KEY=0xYOUR_PRIVATE_KEY
 # DEST_ADDRESS=0xYourDestination
 POLL_MS=50
-HEARTBEAT_MS=50
 GAS_BUMP_PCT=75
-MIN_TIP_GWEI=0
-MIN_MAXFEE_GWEI=0
 MIN_RESERVE_ETH=0.0001
 # TOKEN_ADDRESS=0xYourToken
 MIN_RESERVE_TOKEN=0
-VERBOSE=true
 ENVEOF
 fi
 
-# --- Main app with verbose heartbeat + logs ---
+# Main app (always-verbose console logs)
 cat > index.js <<'JS_EOF'
 #!/usr/bin/env node
 import 'dotenv/config';
-import fs from 'fs';
-import path from 'path';
 import inquirer from 'inquirer';
 import { ethers } from 'ethers';
 
-const LOG_DIR = path.join(process.cwd(), 'logs');
-const LOG_FILE = path.join(LOG_DIR, 'sweeper.log');
-const LOG_JSONL = path.join(LOG_DIR, 'sweeper.jsonl');
-fs.mkdirSync(LOG_DIR, { recursive: true });
-
+// ---------- utils / logging ----------
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-const bump = (x, pct) => (x ? (x * (100n + pct)) / 100n : undefined);
+const t = () => new Date().toISOString();
 const toGwei = (wei) => Number(wei) / 1e9;
+const bump = (x, pct) => (x ? (x * (100n + pct)) / 100n : undefined);
 
-function logLine(msg) {
-  const line = `[${new Date().toISOString()}] ${msg}`;
-  console.log(line);
-  fs.appendFileSync(LOG_FILE, line + '\n');
-}
-function logJson(obj) {
-  fs.appendFileSync(LOG_JSONL, JSON.stringify({ ts: new Date().toISOString(), ...obj }) + '\n');
-}
-function parsePercent(x, def = 0n) { try { return BigInt(String(x)); } catch { return def; } }
+function logInfo(msg){ console.log(`[${t()}] ${msg}`); }
+function logOk(msg){ console.log(`[${t()}] ✅ ${msg}`); }
+function logWarn(msg){ console.log(`[${t()}] ⚠️  ${msg}`); }
+function logErr(msg){ console.log(`[${t()}] ❌ ${msg}`); }
 
-async function getFeesBumped(provider, gasBumpPct, minTipGwei=0, minMaxFeeGwei=0) {
+async function getFeesBumped(provider, gasBumpPctBig) {
   const fd = await provider.getFeeData();
   let { maxFeePerGas, maxPriorityFeePerGas, gasPrice } = fd;
-
   if (!maxFeePerGas) maxFeePerGas = gasPrice ?? 0n;
   if (!maxPriorityFeePerGas) maxPriorityFeePerGas = maxFeePerGas / 10n;
-
-  try {
-    const block = await provider.getBlock('latest');
-    const base = BigInt(block.baseFeePerGas ?? 0);
-    const minTip = BigInt(Math.floor(minTipGwei * 1e9));
-    const minMaxFee = BigInt(Math.floor(minMaxFeeGwei * 1e9));
-    if (maxPriorityFeePerGas < minTip) maxPriorityFeePerGas = minTip;
-    const minFee = base + maxPriorityFeePerGas;
-    if (maxFeePerGas < minFee) maxFeePerGas = minFee;
-    if (maxFeePerGas < minMaxFee) maxFeePerGas = minMaxFee;
-  } catch {}
-
   return {
-    maxFeePerGas: bump(maxFeePerGas, gasBumpPct),
-    maxPriorityFeePerGas: bump(maxPriorityFeePerGas, gasBumpPct),
+    maxFeePerGas: bump(maxFeePerGas, gasBumpPctBig),
+    maxPriorityFeePerGas: bump(maxPriorityFeePerGas, gasBumpPctBig),
   };
 }
 
-// ---------- ETH sweeper ----------
+// ---------- ETH sweeper (native coin) ----------
 async function runEthSweeper(cfg) {
-  const { rpcUrl, privateKey, dest, minReserveEth, pollMs, gasBumpPct, minTipGwei, minMaxFeeGwei, heartbeatMs, verbose } = cfg;
+  const { rpcUrl, privateKey, dest, minReserveEth, pollMs, gasBumpPctBig } = cfg;
 
   const provider = rpcUrl.startsWith('ws')
     ? new ethers.WebSocketProvider(rpcUrl)
     : new ethers.JsonRpcProvider(rpcUrl);
-  // ethers برای HTTP عملاً زیر ~50ms را محدود می‌کند؛ با این حال سعی می‌کنیم به pollMs نزدیک شویم
   provider.pollingInterval = Math.max(10, pollMs);
 
   const wallet = new ethers.Wallet(privateKey, provider);
   let sweeping = false;
-  let pendingTx = null;
+  let pendingTx = null; // {hash, nonce}
 
-  async function trySweep(reason='manual') {
+  async function trySweep(reason='poll') {
     if (sweeping) return;
     sweeping = true;
     try {
-      // بلوکه کردن ارسال جدید در صورت pending (پرهیز از replacement underpriced)
+      // اگر TX قبلی هنوز pending است، دوباره نفرست
       if (pendingTx) {
         const txOnChain = await provider.getTransaction(pendingTx.hash);
-        if (txOnChain && !txOnChain.blockNumber) { return; } else { pendingTx = null; }
+        if (txOnChain && !txOnChain.blockNumber) {
+          logInfo(`Pending tx still in mempool (nonce ${pendingTx.nonce}). Skipping...`);
+          return;
+        }
+        pendingTx = null; // mined or dropped
       }
 
-      const balance = await provider.getBalance(wallet.address, 'latest');
-      const reserveWei = ethers.parseEther(minReserveEth || '0');
-      if (balance <= reserveWei) return;
+      const bal = await provider.getBalance(wallet.address, 'latest');
+      const reserve = ethers.parseEther(minReserveEth || '0');
+      if (bal <= reserve) {
+        logInfo(`Checking... balance=${ethers.formatEther(bal)} ETH (no sweep)`);
+        return;
+      }
 
-      let { maxFeePerGas, maxPriorityFeePerGas } = await getFeesBumped(provider, gasBumpPct, minTipGwei, minMaxFeeGwei);
+      const { maxFeePerGas, maxPriorityFeePerGas } = await getFeesBumped(provider, gasBumpPctBig);
       const gasLimit = 21000n;
       const totalFee = maxFeePerGas ? gasLimit * maxFeePerGas : 0n;
-      const sendValue = balance - reserveWei - totalFee;
-      if (sendValue <= 0n) return;
+      const sendValue = bal - reserve - totalFee;
+      if (sendValue <= 0n) {
+        logWarn('Balance exists but insufficient for fees after reserve.');
+        return;
+      }
 
       const nonce = await provider.getTransactionCount(wallet.address, 'pending');
+      logInfo(`Preparing ETH tx [${reason}] value=${ethers.formatEther(sendValue)} nonce=${nonce} maxFee=${toGwei(maxFeePerGas)}g tip=${toGwei(maxPriorityFeePerGas)}g`);
+
       const tx = await wallet.sendTransaction({
         to: dest,
         value: sendValue,
@@ -174,44 +151,31 @@ async function runEthSweeper(cfg) {
         maxPriorityFeePerGas,
         nonce,
       });
-      pendingTx = { hash: tx.hash, nonce, maxFeePerGas, maxPriorityFeePerGas };
 
-      logLine(`ETH sent (${reason}) value=${ethers.formatEther(sendValue)} nonce=${nonce} maxFee=${toGwei(maxFeePerGas)}g tip=${toGwei(maxPriorityFeePerGas)}g tx=${tx.hash}`);
-      logJson({ type:'eth_send', reason, value_eth: Number(ethers.formatEther(sendValue)), nonce, maxFee_gwei: toGwei(maxFeePerGas), tip_gwei: toGwei(maxPriorityFeePerGas), tx: tx.hash });
+      pendingTx = { hash: tx.hash, nonce };
+      logOk(`ETH tx sent: ${tx.hash}`);
+      // تایید را در پس‌زمینه گوش کن
+      tx.wait().then(rcpt => {
+        if (rcpt && rcpt.status === 1) {
+          console.log(`[${t()}] ✔ Confirmed in block ${rcpt.blockNumber} (gasUsed=${rcpt.gasUsed})`);
+        } else {
+          console.log(`[${t()}] ✖ Tx failed (status 0)`);
+        }
+      }).catch(e => {
+        logWarn(`Tx replaced or dropped: ${e?.message || e}`);
+      });
     } catch (e) {
-      logLine(`ETH sweep error: ${e?.reason || e?.message || e}`);
-      logJson({ type:'eth_error', message: e?.message || String(e) });
+      logErr(e?.reason || e?.message || String(e));
     } finally { sweeping = false; }
   }
 
-  // Heartbeat: هر heartbeatMs لاگِ لحظه‌ای (balance+baseFee)
-  async function heartbeat() {
-    try {
-      const [block, bal] = await Promise.all([
-        provider.getBlock('latest'),
-        provider.getBalance(wallet.address, 'latest'),
-      ]);
-      const base = block?.baseFeePerGas ? toGwei(BigInt(block.baseFeePerGas)) : 0;
-      const line = `HB block=${block?.number ?? 'n/a'} baseFee=${base}g bal=${ethers.formatEther(bal)}`;
-      if (verbose) logLine(line); else fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
-      logJson({ type:'heartbeat', block: block?.number, baseFee_gwei: base, balance_eth: Number(ethers.formatEther(bal)) });
-    } catch (e) {
-      if (verbose) logLine(`HB error: ${e?.message || e}`);
-    }
-  }
-
   const net = await provider.getNetwork();
-  logLine(`Connected chainId=${net.chainId} address=${wallet.address}`);
-
-  // واکنشِ سریع
+  logInfo(`Connected chainId=${net.chainId} address=${wallet.address}`);
   provider.on('block', () => trySweep('block'));
   if (pollMs > 0) setInterval(() => trySweep('poll'), Math.max(1, pollMs));
-  if (heartbeatMs > 0) setInterval(() => heartbeat(), Math.max(1, heartbeatMs));
-
-  await heartbeat();
   await trySweep('startup');
 
-  logLine('ETH sweeper running… Press Ctrl+C to exit.');
+  logInfo('ETH sweeper running… Press Ctrl+C to exit.');
   while (true) { await sleep(60_000); }
 }
 
@@ -225,7 +189,7 @@ const ERC20_ABI = [
 ];
 
 async function runTokenSweeper(cfg) {
-  const { rpcUrl, privateKey, dest, tokenAddr, minReserveToken, pollMs, gasBumpPct, minTipGwei, minMaxFeeGwei, heartbeatMs, verbose } = cfg;
+  const { rpcUrl, privateKey, dest, tokenAddr, minReserveToken, pollMs, gasBumpPctBig } = cfg;
 
   const provider = rpcUrl.startsWith('ws')
     ? new ethers.WebSocketProvider(rpcUrl)
@@ -242,152 +206,141 @@ async function runTokenSweeper(cfg) {
   let sweeping = false;
   let pendingTx = null;
 
-  async function trySweep(reason='manual') {
+  async function trySweep(reason='poll') {
     if (sweeping) return;
     sweeping = true;
     try {
       if (pendingTx) {
         const txOnChain = await provider.getTransaction(pendingTx.hash);
-        if (txOnChain && !txOnChain.blockNumber) return;
+        if (txOnChain && !txOnChain.blockNumber) {
+          logInfo(`Pending ${symbol} tx still in mempool (nonce ${pendingTx.nonce}). Skipping...`);
+          return;
+        }
         pendingTx = null;
       }
 
       const reserve = ethers.parseUnits(minReserveToken || '0', decimals);
       const bal = await token.balanceOf(wallet.address);
-      const available = bal > reserve ? bal - reserve : 0n;
-      if (available <= 0n) return;
+      if (bal <= reserve) {
+        logInfo(`Checking ${symbol}... bal=${ethers.formatUnits(bal, decimals)} (no sweep)`);
+        return;
+      }
 
+      // need ETH for gas
       const ethBal = await provider.getBalance(wallet.address);
-      if (ethBal === 0n) { logLine('Not enough ETH for gas.'); return; }
+      if (ethBal === 0n) { logWarn('Not enough ETH for gas.'); return; }
 
-      let gasLimit;
+      // estimate gas (with safety)
+      let gasLimit = 0n;
       try {
-        gasLimit = await token.estimateGas.transfer(dest, available);
+        gasLimit = await token.estimateGas.transfer(dest, bal - reserve);
         gasLimit = gasLimit + (gasLimit * 20n)/100n;
       } catch { gasLimit = 120000n; }
 
-      let { maxFeePerGas, maxPriorityFeePerGas } = await getFeesBumped(provider, gasBumpPct, minTipGwei, minMaxFeeGwei);
+      const { maxFeePerGas, maxPriorityFeePerGas } = await getFeesBumped(provider, gasBumpPctBig);
       const nonce = await provider.getTransactionCount(wallet.address, 'pending');
-      const tx = await token.transfer(dest, available, { gasLimit, maxFeePerGas, maxPriorityFeePerGas, nonce });
-      pendingTx = { hash: tx.hash, nonce, maxFeePerGas, maxPriorityFeePerGas };
 
-      logLine(`${symbol} sent (${reason}) amount=${ethers.formatUnits(available, decimals)} ${symbol} nonce=${nonce} maxFee=${toGwei(maxFeePerGas)}g tip=${toGwei(maxPriorityFeePerGas)}g tx=${tx.hash}`);
-      logJson({ type:'token_send', symbol, amount: Number(ethers.formatUnits(available, decimals)), nonce, maxFee_gwei: toGwei(maxFeePerGas), tip_gwei: toGwei(maxPriorityFeePerGas), tx: tx.hash, token: tokenAddr });
+      logInfo(`Preparing ${symbol} tx [${reason}] amount=${ethers.formatUnits(bal - reserve, decimals)} nonce=${nonce} maxFee=${toGwei(maxFeePerGas)}g tip=${toGwei(maxPriorityFeePerGas)}g`);
+
+      const tx = await token.transfer(dest, bal - reserve, {
+        gasLimit, maxFeePerGas, maxPriorityFeePerGas, nonce
+      });
+
+      pendingTx = { hash: tx.hash, nonce };
+      logOk(`${symbol} tx sent: ${tx.hash}`);
+
+      tx.wait().then(rcpt => {
+        if (rcpt && rcpt.status === 1) {
+          console.log(`[${t()}] ✔ ${symbol} confirmed in block ${rcpt.blockNumber} (gasUsed=${rcpt.gasUsed})`);
+        } else {
+          console.log(`[${t()}] ✖ ${symbol} tx failed (status 0)`);
+        }
+      }).catch(e => {
+        logWarn(`${symbol} tx replaced or dropped: ${e?.message || e}`);
+      });
     } catch (e) {
-      logLine(`Token sweep error: ${e?.reason || e?.message || e}`);
-      logJson({ type:'token_error', message: e?.message || String(e), token: tokenAddr });
+      logErr(e?.reason || e?.message || String(e));
     } finally { sweeping = false; }
   }
 
-  async function heartbeat() {
-    try {
-      const [block, ethBal, tokBal] = await Promise.all([
-        provider.getBlock('latest'),
-        provider.getBalance(wallet.address, 'latest'),
-        token.balanceOf(wallet.address).catch(() => 0n),
-      ]);
-      const base = block?.baseFeePerGas ? toGwei(BigInt(block.baseFeePerGas)) : 0;
-      const line = `HB block=${block?.number ?? 'n/a'} baseFee=${base}g ETH=${ethers.formatEther(ethBal)} TOK=${ethers.formatUnits(tokBal, decimals)} ${symbol}`;
-      if (verbose) logLine(line); else fs.appendFileSync(LOG_FILE, `[${new Date().toISOString()}] ${line}\n`);
-      logJson({ type:'heartbeat', block: block?.number, baseFee_gwei: base, balance_eth: Number(ethers.formatEther(ethBal)), token_balance: Number(ethers.formatUnits(tokBal, decimals)), symbol });
-    } catch (e) {
-      if (verbose) logLine(`HB error: ${e?.message || e}`);
-    }
-  }
-
   const net = await provider.getNetwork();
-  logLine(`Connected chainId=${net.chainId} address=${wallet.address} token=${symbol}@${tokenAddr}`);
+  logInfo(`Connected chainId=${net.chainId} address=${wallet.address} token=${symbol}@${tokenAddr}`);
 
+  // Event (WS) + polling
   try {
     const incoming = token.filters.Transfer(null, wallet.address);
     token.on(incoming, () => trySweep('event'));
-    logLine('Subscribed to token Transfer events.');
-  } catch {
-    logLine('Event subscription unavailable; using polling only.');
-  }
+    logInfo(`Subscribed to ${symbol} Transfer events.`);
+  } catch { /* ignore if WS not available */ }
 
   if (pollMs > 0) setInterval(() => trySweep('poll'), Math.max(1, pollMs));
-  if (heartbeatMs > 0) setInterval(() => heartbeat(), Math.max(1, heartbeatMs));
-
-  await heartbeat();
   await trySweep('startup');
 
-  logLine('Token sweeper running… Press Ctrl+C to exit.');
+  logInfo('Token sweeper running… Press Ctrl+C to exit.');
   while (true) { await sleep(60_000); }
 }
 
-// ---------- Interactive CLI ----------
+// ---------- CLI (English, minimal prompts; logs always shown) ----------
 async function main() {
-  console.log('EVM FCFS Sweeper (ETH or ERC-20) with Live Monitor\n');
+  console.log('EVM FCFS Sweeper — Live console logs (ETH or ERC-20)\n');
 
   const a = await inquirer.prompt([
-    { type: 'list', name: 'assetType', message: 'What do you want to sweep?', choices: [
+    {
+      type: 'list',
+      name: 'assetType',
+      message: 'What do you want to sweep?',
+      choices: [
         { name: 'ETH (native coin)', value: 'ETH' },
-        { name: 'ERC-20 token (requires contract address)', value: 'TOKEN' },
-      ], default: process.env.TOKEN_ADDRESS ? 'TOKEN' : 'ETH' },
-    { type: 'input', name: 'rpcUrl', message: 'RPC URL (prefer WebSocket for speed):',
-      default: process.env.RPC_URL || 'wss://ethereum.publicnode.com',
-      validate: (x) => (x && (x.startsWith('http') || x.startsWith('ws'))) ? true : 'Provide a valid http(s) or ws(s) URL' },
-    { type: 'password', mask: '*', name: 'privateKey', message: 'Private key of the receiving wallet:',
-      default: process.env.PRIVATE_KEY || undefined, validate: (x) => /^0x[0-9a-fA-F]{64}$/.test(x) ? true : 'Must be a 0x-prefixed 32-byte hex key' },
-    { type: 'input', name: 'dest', message: 'Destination address to forward funds to:',
-      default: process.env.DEST_ADDRESS || '', validate: (x) => /^0x[0-9a-fA-F]{40}$/.test(x) ? true : 'Must be a valid 0x-address' },
+        { name: 'ERC-20 token (requires contract address)', value: 'TOKEN' }
+      ],
+      default: process.env.TOKEN_ADDRESS ? 'TOKEN' : 'ETH'
+    },
+    { type: 'input', name: 'rpcUrl', message: 'RPC URL (http(s) or ws(s)):', default: process.env.RPC_URL || '' },
+    { type: 'password', mask: '*', name: 'privateKey', message: 'Private key (0x…64 hex):', default: process.env.PRIVATE_KEY || '',
+      validate: (x)=>/^0x[0-9a-fA-F]{64}$/.test(x) ? true : 'Must be 0x + 64 hex' },
+    { type: 'input', name: 'dest', message: 'Destination address:', default: process.env.DEST_ADDRESS || '',
+      validate: (x)=>/^0x[0-9a-fA-F]{40}$/.test(x) ? true : 'Invalid 0x address' },
+    { type: 'input', name: 'pollMs', message: 'Polling interval (ms):', default: process.env.POLL_MS || '50',
+      filter: Number, validate: (x)=>!Number.isNaN(x) && x>=0 ? true : 'Enter >= 0' },
+    { type: 'input', name: 'gasBumpPct', message: 'Gas bump percent over network suggestion:',
+      default: process.env.GAS_BUMP_PCT || '75', filter: (x)=>BigInt(x), validate: (x)=>/^\d+$/.test(x) ? true : 'Enter integer' },
 
-    { type: 'input', name: 'pollMs', message: 'Sweep polling interval (ms) — 1–200ms is typical:',
-      default: process.env.POLL_MS || '50', filter: (x) => Number(x),
-      validate: (x) => !Number.isNaN(Number(x)) && Number(x) >= 0 ? true : 'Enter a non-negative number' },
-    { type: 'input', name: 'heartbeatMs', message: 'Live monitor (heartbeat) interval (ms) — set 1 for near-millisecond logs:',
-      default: process.env.HEARTBEAT_MS || '50', filter: (x) => Number(x),
-      validate: (x) => !Number.isNaN(Number(x)) && Number(x) >= 0 ? true : 'Enter a non-negative number' },
-    { type: 'confirm', name: 'verbose', message: 'Show heartbeat logs in console (in addition to files)?', default: (process.env.VERBOSE || 'true') === 'true' },
+    // ETH only
+    { type: 'input', name: 'minReserveEth', message: '(ETH) Minimum ETH to keep for fees:',
+      default: process.env.MIN_RESERVE_ETH || '0.0001', when: (a)=>a.assetType==='ETH',
+      validate: (x)=>{ try{ ethers.parseEther(String(x)); return true; } catch { return 'Invalid ETH amount'; } } },
 
-    { type: 'input', name: 'gasBumpPct', message: 'Gas bump percent over suggested network fees:',
-      default: process.env.GAS_BUMP_PCT || '75', validate: (x) => /^\d+$/.test(x) ? true : 'Enter an integer percent (e.g., 75)' },
-    { type: 'input', name: 'minTipGwei', message: 'Minimum priority tip (gwei) to use (optional):',
-      default: process.env.MIN_TIP_GWEI || '0', filter: (x) => Number(x),
-      validate: (x) => !Number.isNaN(Number(x)) && Number(x) >= 0 ? true : 'Enter a non-negative number' },
-    { type: 'input', name: 'minMaxFeeGwei', message: 'Minimum maxFeePerGas (gwei) to enforce (optional):',
-      default: process.env.MIN_MAXFEE_GWEI || '0', filter: (x) => Number(x),
-      validate: (x) => !Number.isNaN(Number(x)) && Number(x) >= 0 ? true : 'Enter a non-negative number' },
-
-    { type: 'input', name: 'minReserveEth', message: '(ETH) Minimum ETH to keep in the wallet (for fees), in ETH:',
-      default: process.env.MIN_RESERVE_ETH || '0.0001', when: (a) => a.assetType === 'ETH',
-      validate: (x) => { try { ethers.parseEther(String(x)); return true; } catch { return 'Enter a valid ETH amount'; } } },
-
-    { type: 'input', name: 'tokenAddr', message: '(TOKEN) ERC-20 contract address:',
-      default: process.env.TOKEN_ADDRESS || '', when: (a) => a.assetType === 'TOKEN',
-      validate: (x) => /^0x[0-9a-fA-F]{40}$/.test(x) ? true : 'Must be a valid 0x-address' },
-    { type: 'input', name: 'minReserveToken', message: '(TOKEN) Minimum token amount to keep (human units):',
-      default: process.env.MIN_RESERVE_TOKEN || '0', when: (a) => a.assetType === 'TOKEN',
-      validate: (x) => x !== '' ? true : 'Provide a number (e.g., 0 or 0.001)' },
+    // Token only
+    { type: 'input', name: 'tokenAddr', message: '(TOKEN) ERC-20 contract:',
+      default: process.env.TOKEN_ADDRESS || '', when: (a)=>a.assetType==='TOKEN',
+      validate: (x)=>/^0x[0-9a-fA-F]{40}$/.test(x) ? true : 'Invalid 0x address' },
+    { type: 'input', name: 'minReserveToken', message: '(TOKEN) Minimum token to keep (human units):',
+      default: process.env.MIN_RESERVE_TOKEN || '0', when: (a)=>a.assetType==='TOKEN',
+      validate: (x)=>x!=='' ? true : 'Enter a number' }
   ]);
 
-  const cfg = {
+  const baseCfg = {
     rpcUrl: a.rpcUrl,
     privateKey: a.privateKey,
     dest: a.dest,
     pollMs: Number(a.pollMs),
-    heartbeatMs: Number(a.heartbeatMs),
-    verbose: !!a.verbose,
-    gasBumpPct: parsePercent(a.gasBumpPct, 0n),
-    minTipGwei: Number(a.minTipGwei || 0),
-    minMaxFeeGwei: Number(a.minMaxFeeGwei || 0),
+    gasBumpPctBig: a.gasBumpPct
   };
 
   if (a.assetType === 'ETH') {
-    await runEthSweeper({ ...cfg, minReserveEth: String(a.minReserveEth) });
+    await runEthSweeper({ ...baseCfg, minReserveEth: String(a.minReserveEth) });
   } else {
-    await runTokenSweeper({ ...cfg, tokenAddr: a.tokenAddr, minReserveToken: String(a.minReserveToken) });
+    await runTokenSweeper({ ...baseCfg, tokenAddr: a.tokenAddr, minReserveToken: String(a.minReserveToken) });
   }
 }
 
 main().catch((e) => {
-  logLine('FATAL: ' + (e?.message || String(e)));
+  logErr(e?.message || String(e));
   process.exit(1);
 });
 JS_EOF
 
 chmod +x index.js
 
-echo ">>> Starting the interactive sweeper…"
+echo ">>> Starting the sweeper..."
 node index.js
