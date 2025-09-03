@@ -1,231 +1,157 @@
-#!/usr/bin/env node
-import 'dotenv/config';
+#!/usr/bin/env bash
+set -euo pipefail
+
+PROJECT_DIR="${HOME}/fcfs-transfer"
+NODE_VERSION="lts/*"
+
+# Check curl
+if ! command -v curl >/dev/null 2>&1; then
+  if command -v apt-get >/dev/null 2>&1; then sudo apt-get update && sudo apt-get install -y curl
+  elif command -v yum >/dev/null 2>&1; then sudo yum install -y curl
+  elif command -v brew >/dev/null 2>&1; then brew install curl
+  else echo "Please install curl"; exit 1
+  fi
+fi
+
+# Install nvm if not present
+if [ -z "${NVM_DIR:-}" ]; then export NVM_DIR="$HOME/.nvm"; fi
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+fi
+# shellcheck disable=SC1090
+. "$NVM_DIR/nvm.sh"
+nvm install "${NODE_VERSION}" >/dev/null
+nvm use "${NODE_VERSION}" >/dev/null
+
+mkdir -p "${PROJECT_DIR}"
+cd "${PROJECT_DIR}"
+
+# package.json
+cat > package.json <<'PKG'
+{
+  "name": "fcfs-transfer",
+  "version": "2.0.0",
+  "type": "module",
+  "dependencies": {
+    "ethers": "^6.13.2",
+    "inquirer": "^9.2.15"
+  }
+}
+PKG
+
+npm install >/dev/null
+
+# index.js
+cat > index.js <<'JS'
 import inquirer from 'inquirer';
 import { ethers } from 'ethers';
 
-// ---------- utils ----------
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const t = () => new Date().toISOString();
-const toGwei = (wei) => Number(wei) / 1e9;
-const bump = (x, pct) => (x ? (x * (100n + pct)) / 100n : undefined);
+const log = (m) => console.log(`[${t()}] ${m}`);
+const ok = (m) => console.log(`[${t()}] ✅ ${m}`);
+const err = (m) => console.log(`[${t()}] ❌ ${m}`);
 
-function ok(m){ console.log(`[${t()}] ✅ ${m}`); }
-function info(m){ console.log(`[${t()}] ${m}`); }
-function warn(m){ console.log(`[${t()}] ⚠️  ${m}`); }
-function err(m){ console.log(`[${t()}] ❌ ${m}`); }
-
-async function getFees(provider, bumpPctBig) {
+async function getFees(provider, bump=0n) {
   const fd = await provider.getFeeData();
   let { maxFeePerGas, maxPriorityFeePerGas, gasPrice } = fd;
   if (!maxFeePerGas) maxFeePerGas = gasPrice ?? 0n;
-  if (!maxPriorityFeePerGas) maxPriorityFeePerGas = maxFeePerGas / 10n;
-
-  try {
-    const blk = await provider.getBlock('latest');
-    const base = BigInt(blk?.baseFeePerGas ?? 0);
-    if (maxFeePerGas < base + maxPriorityFeePerGas) {
-      maxFeePerGas = base + maxPriorityFeePerGas;
-    }
-  } catch {}
+  if (!maxPriorityFeePerGas) maxPriorityFeePerGas = maxFeePerGas/10n;
   return {
-    maxFeePerGas: bump(maxFeePerGas, bumpPctBig),
-    maxPriorityFeePerGas: bump(maxPriorityFeePerGas, bumpPctBig),
+    maxFeePerGas: (maxFeePerGas * (100n+bump))/100n,
+    maxPriorityFeePerGas: (maxPriorityFeePerGas * (100n+bump))/100n,
   };
 }
 
-// ---------- ETH sweeper ----------
-async function runEthSweeper({ rpcUrl, privateKey, dest, minReserveEth, pollMs, gasBumpPctBig }) {
-  const provider = rpcUrl.startsWith('ws') ? new ethers.WebSocketProvider(rpcUrl) : new ethers.JsonRpcProvider(rpcUrl);
-  provider.pollingInterval = Math.max(10, pollMs);
-
-  const wallet = new ethers.Wallet(privateKey, provider);
-  let sweeping = false;
-  let pendingTx = null;
-
-  async function trySweep(reason='poll') {
-    if (sweeping) return;
-    sweeping = true;
+async function sendWithBump(sendFn, provider, maxRetries=5) {
+  let bump = 20n; // start 20% higher
+  for (let i=0; i<maxRetries; i++) {
     try {
-      if (pendingTx) {
-        const onchain = await provider.getTransaction(pendingTx.hash);
-        if (onchain && !onchain.blockNumber) {
-          info(`Pending tx (nonce ${pendingTx.nonce}) still in mempool. Skipping…`);
-          return;
-        }
-        pendingTx = null;
-      }
-
-      const [balance, fees] = await Promise.all([
-        provider.getBalance(wallet.address, 'latest'),
-        getFees(provider, gasBumpPctBig),
-      ]);
-
-      const reserveWei = ethers.parseEther(minReserveEth || '0');
-      if (balance <= reserveWei) {
-        info(`Checking… balance=${ethers.formatEther(balance)} ETH (no sweep)`);
-        return;
-      }
-
-      const gasLimit = 21000n;
-      const fee = gasLimit * fees.maxFeePerGas;
-      const boostedFee = fee * 2n; // double fee for safety
-
-      let sendValue = balance - reserveWei - boostedFee;
-      if (sendValue <= 0n) {
-        info(`Balance too low after boosted fee. Skipping…`);
-        return;
-      }
-
-      const nonce = await provider.getTransactionCount(wallet.address, 'pending');
-      info(`Preparing ETH tx [${reason}] value=${ethers.formatEther(sendValue)} nonce=${nonce} maxFee=${toGwei(fees.maxFeePerGas)}g tip=${toGwei(fees.maxPriorityFeePerGas)}g`);
-
-      const tx = await wallet.sendTransaction({
-        to: dest,
-        value: sendValue,
-        gasLimit,
-        maxFeePerGas: fees.maxFeePerGas,
-        maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
-        nonce,
-      });
-
-      pendingTx = { hash: tx.hash, nonce };
-      ok(`ETH tx sent: ${tx.hash}`);
-
-      tx.wait().then(rcpt => {
-        if (rcpt?.status === 1) console.log(`[${t()}] ✔ Confirmed in block ${rcpt.blockNumber} (gasUsed=${rcpt.gasUsed})`);
-        else console.log(`[${t()}] ✖ Tx failed (status 0)`);
-      }).catch(e => warn(`Tx replaced/dropped: ${e?.message || e}`));
-    } catch (e) {
-      err(e?.reason || e?.message || String(e));
-    } finally { sweeping = false; }
+      const fees = await getFees(provider, bump);
+      return await sendFn(fees);
+    } catch(e) {
+      err(`Send failed: ${e?.reason||e?.message||e}`);
+      bump += 20n; // bump more and retry
+    }
   }
-
-  const net = await provider.getNetwork();
-  info(`Connected chainId=${net.chainId} address=${wallet.address}`);
-  provider.on('block', () => trySweep('block'));
-  if (pollMs > 0) setInterval(() => trySweep('poll'), pollMs);
-  await trySweep('startup');
-  info('ETH sweeper running… Ctrl+C to exit.');
-  while (true) { await sleep(60_000); }
+  throw new Error('All retries failed');
 }
 
-// ---------- Token sweeper ----------
-const ERC20_ABI = [
-  'event Transfer(address indexed from, address indexed to, uint256 value)',
-  'function balanceOf(address) view returns (uint256)',
-  'function transfer(address to, uint256 amount) returns (bool)',
-  'function decimals() view returns (uint8)',
-  'function symbol() view returns (string)'
-];
-
-async function runTokenSweeper({ rpcUrl, privateKey, dest, tokenAddr, minReserveToken, pollMs, gasBumpPctBig }) {
-  const provider = rpcUrl.startsWith('ws') ? new ethers.WebSocketProvider(rpcUrl) : new ethers.JsonRpcProvider(rpcUrl);
-  provider.pollingInterval = Math.max(10, pollMs);
-
-  const wallet = new ethers.Wallet(privateKey, provider);
-  const token = new ethers.Contract(tokenAddr, ERC20_ABI, wallet);
-
-  let decimals = 18, symbol = 'TOKEN';
-  try { decimals = await token.decimals(); } catch {}
-  try { symbol = await token.symbol(); } catch {}
-
-  let sweeping = false;
-  let pendingTx = null;
-
-  async function trySweep(reason='poll') {
-    if (sweeping) return;
-    sweeping = true;
-    try {
-      if (pendingTx) {
-        const onchain = await provider.getTransaction(pendingTx.hash);
-        if (onchain && !onchain.blockNumber) { info(`Pending ${symbol} tx… Skipping`); return; }
-        pendingTx = null;
-      }
-
-      const [tokBal, fees, ethBal] = await Promise.all([
-        token.balanceOf(wallet.address),
-        getFees(provider, gasBumpPctBig),
-        provider.getBalance(wallet.address, 'latest'),
-      ]);
-
-      const reserveTok = ethers.parseUnits(minReserveToken || '0', decimals);
-      let sendTok = tokBal > reserveTok ? (tokBal - reserveTok) : 0n;
-      if (sendTok <= 0n) { info(`${symbol} balance too low (no sweep)`); return; }
-
-      // estimate gas
-      let gasLimit;
-      try {
-        gasLimit = await token.estimateGas.transfer(dest, sendTok);
-        gasLimit = gasLimit + (gasLimit * 20n)/100n;
-      } catch { gasLimit = 120000n; }
-
-      const fee = gasLimit * fees.maxFeePerGas;
-      const boostedFee = fee * 2n;
-
-      if (ethBal <= boostedFee) {
-        info(`Not enough ETH for ${symbol} gas after boosted fee.`);
-        return;
-      }
-
-      const nonce = await provider.getTransactionCount(wallet.address, 'pending');
-      info(`Preparing ${symbol} tx [${reason}] amount=${ethers.formatUnits(sendTok, decimals)} nonce=${nonce} maxFee=${toGwei(fees.maxFeePerGas)}g tip=${toGwei(fees.maxPriorityFeePerGas)}g`);
-
-      const tx = await token.transfer(dest, sendTok, {
-        gasLimit,
-        maxFeePerGas: fees.maxFeePerGas,
-        maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
-        nonce,
-      });
-
-      pendingTx = { hash: tx.hash, nonce };
-      ok(`${symbol} tx sent: ${tx.hash}`);
-
-      tx.wait().then(rcpt => {
-        if (rcpt?.status === 1) console.log(`[${t()}] ✔ ${symbol} confirmed in block ${rcpt.blockNumber}`);
-        else console.log(`[${t()}] ✖ ${symbol} tx failed (status 0)`);
-      }).catch(e => warn(`${symbol} tx replaced/dropped: ${e?.message || e}`));
-    } catch (e) {
-      err(e?.reason || e?.message || String(e));
-    } finally { sweeping = false; }
-  }
-
-  const net = await provider.getNetwork();
-  info(`Connected chainId=${net.chainId} address=${wallet.address} token=${symbol}@${tokenAddr}`);
-  try {
-    const incoming = token.filters.Transfer(null, wallet.address);
-    token.on(incoming, () => trySweep('event'));
-    info(`Subscribed to ${symbol} Transfer events.`);
-  } catch {}
-  if (pollMs > 0) setInterval(() => trySweep('poll'), pollMs);
-  await trySweep('startup');
-  info('Token sweeper running… Ctrl+C to exit.');
-  while (true) { await sleep(60_000); }
+async function sweepETH(provider, wallet, dest) {
+  const bal = await provider.getBalance(wallet.address);
+  if (bal === 0n) { log('Balance=0'); return; }
+  await sendWithBump(async (fees) => {
+    const gasLimit = 21000n;
+    const fee = gasLimit * fees.maxFeePerGas;
+    const value = bal - fee;
+    if (value <= 0n) throw new Error('Not enough for fee');
+    const nonce = await provider.getTransactionCount(wallet.address,'pending');
+    const tx = await wallet.sendTransaction({
+      to: dest, value, gasLimit,
+      maxFeePerGas: fees.maxFeePerGas,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+      nonce
+    });
+    ok(`ETH tx sent: ${tx.hash}`);
+    await tx.wait();
+    ok(`ETH tx confirmed in block ${await provider.getBlockNumber()}`);
+  }, provider);
 }
 
-// ---------- CLI ----------
-async function main() {
-  console.log('EVM FCFS Sweeper — Full sweep (ETH + Tokens)\n');
-  const a = await inquirer.prompt([
-    { type: 'list', name: 'assetType', message: 'What do you want to sweep?', choices: [
-        { name: 'ETH (native coin)', value: 'ETH' },
-        { name: 'ERC-20 token', value: 'TOKEN' }
-      ], default: process.env.TOKEN_ADDRESS ? 'TOKEN' : 'ETH' },
-    { type: 'input', name: 'rpcUrl', message: 'RPC URL:', default: process.env.RPC_URL || '' },
-    { type: 'password', mask: '*', name: 'privateKey', message: 'Private key (0x…):', default: process.env.PRIVATE_KEY || '' },
-    { type: 'input', name: 'dest', message: 'Destination address:', default: process.env.DEST_ADDRESS || '' },
-    { type: 'input', name: 'pollMs', message: 'Polling interval (ms):', default: process.env.POLL_MS || '50', filter: Number },
-    { type: 'input', name: 'gasBumpPct', message: 'Gas bump percent over network suggestion:', default: process.env.GAS_BUMP_PCT || '75', filter: (x)=>BigInt(x) },
-    { type: 'input', name: 'minReserveEth', message: '(ETH) Minimum ETH to keep:', default: process.env.MIN_RESERVE_ETH || '0.0001', when: (a)=>a.assetType==='ETH' },
-    { type: 'input', name: 'tokenAddr', message: '(TOKEN) ERC-20 contract:', default: process.env.TOKEN_ADDRESS || '', when: (a)=>a.assetType==='TOKEN' },
-    { type: 'input', name: 'minReserveToken', message: '(TOKEN) Minimum token to keep:', default: process.env.MIN_RESERVE_TOKEN || '0', when: (a)=>a.assetType==='TOKEN' }
+async function sweepToken(provider, wallet, dest, tokenAddr) {
+  const abi = [
+    'function balanceOf(address) view returns (uint256)',
+    'function transfer(address,uint256) returns (bool)',
+    'function decimals() view returns (uint8)',
+    'function symbol() view returns (string)'
+  ];
+  const token = new ethers.Contract(tokenAddr, abi, wallet);
+  const [bal, decimals, symbol, ethBal] = await Promise.all([
+    token.balanceOf(wallet.address),
+    token.decimals().catch(()=>18),
+    token.symbol().catch(()=> 'TOKEN'),
+    provider.getBalance(wallet.address)
   ]);
+  if (bal === 0n) { log(`${symbol} balance=0`); return; }
+  await sendWithBump(async (fees) => {
+    let gasLimit;
+    try { gasLimit = await token.estimateGas.transfer(dest, bal); }
+    catch { gasLimit = 120000n; }
+    gasLimit = gasLimit + gasLimit/5n;
+    const fee = gasLimit * fees.maxFeePerGas;
+    if (ethBal <= fee) throw new Error('Not enough ETH for gas');
+    const nonce = await provider.getTransactionCount(wallet.address,'pending');
+    const tx = await token.transfer(dest, bal, {
+      gasLimit,
+      maxFeePerGas: fees.maxFeePerGas,
+      maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
+      nonce
+    });
+    ok(`${symbol} tx sent: ${tx.hash}`);
+    await tx.wait();
+    ok(`${symbol} tx confirmed in block ${await provider.getBlockNumber()}`);
+  }, provider);
+}
 
-  const baseCfg = { rpcUrl: a.rpcUrl, privateKey: a.privateKey, dest: a.dest, pollMs: Number(a.pollMs), gasBumpPctBig: a.gasBumpPct };
-
-  if (a.assetType === 'ETH') {
-    await runEthSweeper({ ...baseCfg, minReserveEth: String(a.minReserveEth) });
+async function main() {
+  const a = await inquirer.prompt([
+    {type:'list',name:'asset',message:'Sweep what?',choices:['ETH','TOKEN']},
+    {type:'input',name:'rpcUrl',message:'RPC URL:'},
+    {type:'password',mask:'*',name:'pk',message:'Private key (0x...)'},
+    {type:'input',name:'dest',message:'Destination address:'},
+    {type:'input',name:'token',message:'Token contract address:',when:(x)=>x.asset==='TOKEN'},
+    {type:'input',name:'pollMs',message:'Polling interval (ms):',default:'100',filter:Number}
+  ]);
+  const provider = a.rpcUrl.startsWith('ws') ? new ethers.WebSocketProvider(a.rpcUrl) : new ethers.JsonRpcProvider(a.rpcUrl);
+  provider.pollingInterval=a.pollMs;
+  const wallet = new ethers.Wallet(a.pk,provider);
+  log(`Connected to chainId ${(await provider.getNetwork()).chainId}, address=${wallet.address}`);
+  if (a.asset==='ETH') {
+    setInterval(()=>sweepETH(provider,wallet,a.dest),a.pollMs);
   } else {
-    await runTokenSweeper({ ...baseCfg, tokenAddr: a.tokenAddr, minReserveToken: String(a.minReserveToken) });
+    setInterval(()=>sweepToken(provider,wallet,a.dest,a.token),a.pollMs);
   }
 }
-main().catch((e)=>{ err(e?.message || String(e)); process.exit(1); });
+main();
+JS
+
+node index.js
