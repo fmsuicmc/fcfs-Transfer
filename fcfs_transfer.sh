@@ -1,13 +1,46 @@
-#!/usr/bin/env node
+#!/usr/bin/env bash
+set -euo pipefail
+
+# ===== مسیر پروژه =====
+PROJECT_DIR="$(pwd)"
+
+# ===== نصب Node.js با nvm اگر نبود =====
+if [ -z "${NVM_DIR:-}" ]; then export NVM_DIR="$HOME/.nvm"; fi
+if [ ! -s "$NVM_DIR/nvm.sh" ]; then
+  echo ">>> نصب nvm..."
+  curl -fsSL https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+fi
+# shellcheck disable=SC1090
+. "$NVM_DIR/nvm.sh"
+nvm install --lts >/dev/null
+nvm use --lts >/dev/null
+
+# ===== ساخت package.json =====
+cat > package.json <<'PKG'
+{
+  "name": "fcfs-transfer",
+  "version": "1.0.0",
+  "type": "module",
+  "dependencies": {
+    "ethers": "^6.13.2",
+    "inquirer": "^9.2.15"
+  }
+}
+PKG
+
+echo ">>> نصب پکیج‌ها..."
+npm install >/dev/null
+
+# ===== ساخت index.js =====
+cat > index.js <<'JS'
 import inquirer from 'inquirer';
 import { ethers } from 'ethers';
 
 const t = () => new Date().toISOString();
-const log = (m) => console.log(`[${t()}] ${m}`);
-const ok = (m) => console.log(`[${t()}] ✅ ${m}`);
-const err = (m) => console.log(`[${t()}] ❌ ${m}`);
+const log = (m) => console.log(\`[\${t()}] \${m}\`);
+const ok = (m) => console.log(\`[\${t()}] ✅ \${m}\`);
+const err = (m) => console.log(\`[\${t()}] ❌ \${m}\`);
 
-// ===== Fees =====
 async function getFees(provider, bumpPct=0n) {
   const fd = await provider.getFeeData();
   let { maxFeePerGas, maxPriorityFeePerGas, gasPrice } = fd;
@@ -19,23 +52,23 @@ async function getFees(provider, bumpPct=0n) {
   };
 }
 
-// ===== Send wrapper (با retry و بدون stop) =====
+// ===== ارسال با bump و retry =====
 async function sendWithBump(sendFn, provider, maxRetries=5) {
-  let bump = 20n; // start 20% higher
+  let bump = 20n;
   for (let i=0; i<maxRetries; i++) {
     try {
       const fees = await getFees(provider, bump);
       return await sendFn(fees);
     } catch(e) {
-      err(`Send failed: ${e?.reason || e?.message || e}`);
-      bump += 20n; // bump more
+      err(\`Send failed: \${e?.reason || e?.message || e}\`);
+      bump += 20n;
     }
   }
   err("All retries failed, skipping this round...");
-  return null; // ادامه بده
+  return null;
 }
 
-// ===== ETH sweeper =====
+// ===== ETH Sweeper =====
 async function sweepETH(provider, wallet, dest) {
   const bal = await provider.getBalance(wallet.address);
   if (bal === 0n) { log('Balance=0'); return; }
@@ -52,13 +85,13 @@ async function sweepETH(provider, wallet, dest) {
       maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
       nonce
     });
-    ok(`ETH tx sent: ${tx.hash}`);
+    ok(\`ETH tx sent: \${tx.hash}\`);
     await tx.wait();
-    ok(`ETH tx confirmed in block ${await provider.getBlockNumber()}`);
+    ok(\`ETH tx confirmed in block \${await provider.getBlockNumber()}\`);
   }, provider);
 }
 
-// ===== Token sweeper =====
+// ===== Token Sweeper =====
 async function sweepToken(provider, wallet, dest, tokenAddr) {
   const abi = [
     'function balanceOf(address) view returns (uint256)',
@@ -73,7 +106,7 @@ async function sweepToken(provider, wallet, dest, tokenAddr) {
     token.symbol().catch(()=> 'TOKEN'),
     provider.getBalance(wallet.address)
   ]);
-  if (bal === 0n) { log(`${symbol} balance=0`); return; }
+  if (bal === 0n) { log(\`\${symbol} balance=0\`); return; }
 
   await sendWithBump(async (fees) => {
     let gasLimit;
@@ -89,9 +122,9 @@ async function sweepToken(provider, wallet, dest, tokenAddr) {
       maxPriorityFeePerGas: fees.maxPriorityFeePerGas,
       nonce
     });
-    ok(`${symbol} tx sent: ${tx.hash}`);
+    ok(\`\${symbol} tx sent: \${tx.hash}\`);
     await tx.wait();
-    ok(`${symbol} tx confirmed in block ${await provider.getBlockNumber()}`);
+    ok(\`\${symbol} tx confirmed in block \${await provider.getBlockNumber()}\`);
   }, provider);
 }
 
@@ -109,7 +142,7 @@ async function main() {
   const provider = a.rpcUrl.startsWith('ws') ? new ethers.WebSocketProvider(a.rpcUrl) : new ethers.JsonRpcProvider(a.rpcUrl);
   provider.pollingInterval=a.pollMs;
   const wallet = new ethers.Wallet(a.pk,provider);
-  log(`Connected to chainId ${(await provider.getNetwork()).chainId}, address=${wallet.address}`);
+  log(\`Connected to chainId \${(await provider.getNetwork()).chainId}, address=\${wallet.address}\`);
 
   if (a.asset==='ETH') {
     setInterval(()=>sweepETH(provider,wallet,a.dest),a.pollMs);
@@ -118,3 +151,7 @@ async function main() {
   }
 }
 main();
+JS
+
+# ===== اجرای بات =====
+node index.js
